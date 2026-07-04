@@ -4,6 +4,7 @@ const DRIVE_UPLOAD_API = 'https://www.googleapis.com/upload/drive/v3/files';
 let accessToken = null;
 let tokenClient = null;
 let currentFile = null; // { id, name } または null（新規）
+let allFiles = []; // { id, name, modifiedTime, snippet }
 
 const el = (id) => document.getElementById(id);
 const statusEl = () => el('status');
@@ -53,17 +54,54 @@ async function driveFetch(url, options = {}) {
   return res;
 }
 
+async function fetchSnippet(id) {
+  try {
+    const res = await driveFetch(`${DRIVE_FILES_API}/${id}?alt=media`);
+    const text = await res.text();
+    return text.replace(/\r?\n/g, ' ').trim().slice(0, 50);
+  } catch (e) {
+    return '';
+  }
+}
+
 async function listFiles() {
   setStatus('読み込み中...');
   const q = encodeURIComponent(
     `'${CONFIG.FOLDER_ID}' in parents and trashed=false and mimeType='text/plain'`
   );
   const fields = encodeURIComponent('files(id,name,modifiedTime)');
-  const url = `${DRIVE_FILES_API}?q=${q}&fields=${fields}&orderBy=modifiedTime desc&pageSize=200`;
+  const url = `${DRIVE_FILES_API}?q=${q}&fields=${fields}&pageSize=200`;
   const res = await driveFetch(url);
   const data = await res.json();
-  renderFileList(data.files || []);
+  const files = data.files || [];
+
+  setStatus('本文を読み込み中...');
+  const snippets = await Promise.all(files.map((f) => fetchSnippet(f.id)));
+  allFiles = files.map((f, i) => ({ ...f, snippet: snippets[i] }));
+
+  sortAndRender();
   setStatus('');
+}
+
+function sortAndRender() {
+  const sortValue = el('sort-select').value;
+  const sorted = [...allFiles];
+  switch (sortValue) {
+    case 'name-desc':
+      sorted.sort((a, b) => stripExt(b.name).localeCompare(stripExt(a.name), 'ja', { numeric: true }));
+      break;
+    case 'modified-desc':
+      sorted.sort((a, b) => new Date(b.modifiedTime) - new Date(a.modifiedTime));
+      break;
+    case 'modified-asc':
+      sorted.sort((a, b) => new Date(a.modifiedTime) - new Date(b.modifiedTime));
+      break;
+    case 'name-asc':
+    default:
+      sorted.sort((a, b) => stripExt(a.name).localeCompare(stripExt(b.name), 'ja', { numeric: true }));
+      break;
+  }
+  renderFileList(sorted);
 }
 
 function renderFileList(files) {
@@ -77,7 +115,17 @@ function renderFileList(files) {
   }
   for (const f of files) {
     const li = document.createElement('li');
-    li.textContent = stripExt(f.name);
+
+    const titleEl = document.createElement('div');
+    titleEl.className = 'file-title';
+    titleEl.textContent = stripExt(f.name);
+    li.appendChild(titleEl);
+
+    const snippetEl = document.createElement('div');
+    snippetEl.className = 'file-snippet';
+    snippetEl.textContent = f.snippet || '';
+    li.appendChild(snippetEl);
+
     li.addEventListener('click', () => openFile(f.id, f.name));
     listEl.appendChild(li);
   }
@@ -178,6 +226,7 @@ window.addEventListener('load', () => {
   el('signout-btn').addEventListener('click', signOut);
   el('new-btn').addEventListener('click', newFile);
   el('refresh-btn').addEventListener('click', listFiles);
+  el('sort-select').addEventListener('change', sortAndRender);
   el('back-btn').addEventListener('click', showListView);
   el('save-btn').addEventListener('click', saveFile);
 });
