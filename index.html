@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>Plot TEXT エディタ</title>
+<link rel="stylesheet" href="style.css">
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+</head>
+<body>
+  <header>
+    <h1>Plot TEXT エディタ</h1>
+    <button id="signin-btn">Googleでサインイン</button>
+    <button id="signout-btn" class="hidden">サインアウト</button>
+  </header>
+
+  <main id="app" class="hidden">
+    <section id="list-view">
+      <div class="toolbar">
+        <button id="new-btn">＋ 新規メモ</button>
+        <button id="refresh-btn">更新</button>
+      </div>
+      <ul id="file-list"></ul>
+    </section>
+
+    <section id="editor-view" class="hidden">
+      <div class="toolbar">
+        <button id="back-btn">← 一覧へ</button>
+        <button id="save-btn">保存</button>
+      </div>
+      <input id="title-input" type="text" placeholder="タイトル（ファイル名）">
+      <textarea id="body-input" placeholder="本文を入力"></textarea>
+    </section>
+  </main>
+
+  <p id="status"></p>
+
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
