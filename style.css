@@ -107,6 +107,14 @@ main {
   background: #eee;
 }
 
+#file-list li[draggable="true"] {
+  cursor: grab;
+}
+
+#file-list li[draggable="true"] .file-main {
+  cursor: grab;
+}
+
 #file-list li.dragging {
   opacity: 0.4;
 }

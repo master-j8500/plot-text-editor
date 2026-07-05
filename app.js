@@ -11,6 +11,8 @@ let writtenFolderId = null;
 let reorderMode = false;
 let orderedFiles = []; // 並べ替えモード中の表示順
 let dragSrcIndex = null;
+let autoScrollRAF = null;
+let lastDragClientY = 0;
 
 const el = (id) => document.getElementById(id);
 const statusEl = () => el('status');
@@ -187,6 +189,7 @@ function enterReorderMode() {
 function exitReorderMode(reRender = true) {
   reorderMode = false;
   dragSrcIndex = null;
+  stopAutoScroll();
   el('sort-select').disabled = false;
   el('reorder-btn').textContent = '並べ替えモード';
   el('renumber-btn').classList.add('hidden');
@@ -196,6 +199,27 @@ function exitReorderMode(reRender = true) {
 function toggleReorderMode() {
   if (reorderMode) exitReorderMode();
   else enterReorderMode();
+}
+
+function startAutoScroll() {
+  const EDGE = 90;
+  const MAX_SPEED = 18;
+  const step = () => {
+    const y = lastDragClientY;
+    const h = window.innerHeight;
+    if (y < EDGE) {
+      window.scrollBy(0, -MAX_SPEED * (1 - y / EDGE));
+    } else if (y > h - EDGE) {
+      window.scrollBy(0, MAX_SPEED * (1 - (h - y) / EDGE));
+    }
+    autoScrollRAF = requestAnimationFrame(step);
+  };
+  if (!autoScrollRAF) autoScrollRAF = requestAnimationFrame(step);
+}
+
+function stopAutoScroll() {
+  if (autoScrollRAF) cancelAnimationFrame(autoScrollRAF);
+  autoScrollRAF = null;
 }
 
 function renderFileList(files) {
@@ -221,10 +245,13 @@ function renderFileList(files) {
         dragSrcIndex = orderedFiles.findIndex((x) => x.id === f.id);
         e.dataTransfer.effectAllowed = 'move';
         li.classList.add('dragging');
+        lastDragClientY = e.clientY;
+        startAutoScroll();
       });
       li.addEventListener('dragend', () => {
         li.classList.remove('dragging');
         dragSrcIndex = null;
+        stopAutoScroll();
       });
       li.addEventListener('dragover', (e) => {
         e.preventDefault();
@@ -251,10 +278,12 @@ function renderFileList(files) {
     snippetEl.textContent = f.snippet || '';
     mainEl.appendChild(snippetEl);
 
-    mainEl.addEventListener('click', () => openFile(f.id, f.name));
+    if (!reorderMode) {
+      mainEl.addEventListener('click', () => openFile(f.id, f.name));
+    }
     li.appendChild(mainEl);
 
-    if (currentFolder === 'active') {
+    if (currentFolder === 'active' && !reorderMode) {
       const archiveBtn = document.createElement('button');
       archiveBtn.className = 'archive-btn';
       archiveBtn.textContent = '執筆済みへ';
@@ -409,6 +438,11 @@ function signOut() {
 
 window.addEventListener('load', () => {
   initGoogle();
+  document.addEventListener('dragover', (e) => {
+    if (!reorderMode) return;
+    e.preventDefault();
+    lastDragClientY = e.clientY;
+  });
   el('signin-btn').addEventListener('click', () => tokenClient.requestAccessToken());
   el('signout-btn').addEventListener('click', signOut);
   el('new-btn').addEventListener('click', newFile);
