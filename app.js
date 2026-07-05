@@ -9,6 +9,7 @@ let accessToken = null;
 let tokenClient = null;
 let tokenObtainedAt = 0;
 let tokenResolve = null; // requestAccessToken を Promise 化するための resolver
+let tokenRefreshTimer = null; // 失効前サイレント更新のタイマー
 let currentFile = null; // { id, name } または null（新規）
 let allFiles = []; // { id, name, modifiedTime, snippet }
 let currentFolder = 'active'; // 'active' | 'written'
@@ -118,14 +119,35 @@ function maybeRestoreDraft(serverTitle, serverBody) {
 
 function ensureToken(interactive) {
   return new Promise((resolve) => {
-    tokenResolve = resolve;
+    let settled = false;
+    // callback / error_callback / タイムアウトのいずれか一度だけ解決する
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(guard);
+      if (tokenResolve === finish) tokenResolve = null;
+      resolve(ok);
+    };
+    // GISが無応答でも固まらないよう保険（10秒）
+    const guard = setTimeout(() => finish(false), 10000);
+    tokenResolve = finish;
     try {
       tokenClient.requestAccessToken({ prompt: interactive ? '' : 'none' });
     } catch (e) {
-      tokenResolve = null;
-      resolve(false);
+      finish(false);
     }
   });
+}
+
+// 失効の2分前にサイレント更新を予約する（放置中もトークンを延命）
+function scheduleTokenRefresh(expiresInSec) {
+  if (tokenRefreshTimer) clearTimeout(tokenRefreshTimer);
+  const lead = 120; // 秒
+  const delayMs = Math.max((expiresInSec - lead) * 1000, 30000);
+  tokenRefreshTimer = setTimeout(async () => {
+    if (!accessToken) return;
+    await ensureToken(false); // 成功すれば callback 側で次回分が再スケジュールされる
+  }, delayMs);
 }
 
 async function onSignedIn() {
@@ -559,7 +581,15 @@ function initGoogle() {
       }
       accessToken = resp.access_token;
       tokenObtainedAt = Date.now();
+      scheduleTokenRefresh(Number(resp.expires_in) || 3600);
       if (resolve) resolve(true);
+    },
+    error_callback: (err) => {
+      // prompt:'none' のサイレント更新失敗などはここに来る（callbackは呼ばれない）
+      const resolve = tokenResolve;
+      tokenResolve = null;
+      if (resolve) resolve(false);
+      else setStatus(`サインインエラー: ${err && err.type ? err.type : '認証に失敗しました'}`);
     },
   });
 }
@@ -570,6 +600,10 @@ function signOut() {
   }
   accessToken = null;
   tokenObtainedAt = 0;
+  if (tokenRefreshTimer) {
+    clearTimeout(tokenRefreshTimer);
+    tokenRefreshTimer = null;
+  }
   showApp(false);
 }
 
