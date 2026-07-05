@@ -1,9 +1,14 @@
 const DRIVE_FILES_API = 'https://www.googleapis.com/drive/v3/files';
 const DRIVE_UPLOAD_API = 'https://www.googleapis.com/upload/drive/v3/files';
 const WRITTEN_FOLDER_NAME = '執筆済み';
+const DRAFT_PREFIX = 'plotdraft:';
+const NEW_DRAFT_KEY = '__new__';
+const TOKEN_REFRESH_MS = 45 * 60 * 1000; // 45分経過したら保存前にトークンを更新
 
 let accessToken = null;
 let tokenClient = null;
+let tokenObtainedAt = 0;
+let tokenResolve = null; // requestAccessToken を Promise 化するための resolver
 let currentFile = null; // { id, name } または null（新規）
 let allFiles = []; // { id, name, modifiedTime, snippet }
 let currentFolder = 'active'; // 'active' | 'written'
@@ -13,6 +18,7 @@ let orderedFiles = []; // 並べ替えモード中の表示順
 let dragSrcIndex = null;
 let autoScrollRAF = null;
 let lastDragClientY = 0;
+let draftTimer = null;
 
 const el = (id) => document.getElementById(id);
 const statusEl = () => el('status');
@@ -42,6 +48,92 @@ function stripExt(name) {
   return name.endsWith('.txt') ? name.slice(0, -4) : name;
 }
 
+function isEditorOpen() {
+  return !el('editor-view').classList.contains('hidden');
+}
+
+// --- ① ローカル下書き自動保存 ---
+
+function draftKey() {
+  return DRAFT_PREFIX + (currentFile && currentFile.id ? currentFile.id : NEW_DRAFT_KEY);
+}
+
+function saveDraftNow() {
+  if (!isEditorOpen()) return;
+  const data = {
+    title: el('title-input').value,
+    body: el('body-input').value,
+    ts: Date.now(),
+  };
+  try {
+    localStorage.setItem(draftKey(), JSON.stringify(data));
+  } catch (e) {
+    /* localStorage不可でも致命的ではない */
+  }
+}
+
+function scheduleDraftSave() {
+  if (draftTimer) clearTimeout(draftTimer);
+  draftTimer = setTimeout(saveDraftNow, 1000);
+}
+
+function clearDraft(key) {
+  try {
+    localStorage.removeItem(key || draftKey());
+  } catch (e) {
+    /* noop */
+  }
+}
+
+// 開いた内容とローカル下書きに差分があれば復元を提案する
+function maybeRestoreDraft(serverTitle, serverBody) {
+  let raw;
+  try {
+    raw = localStorage.getItem(draftKey());
+  } catch (e) {
+    return;
+  }
+  if (!raw) return;
+  let d;
+  try {
+    d = JSON.parse(raw);
+  } catch (e) {
+    clearDraft();
+    return;
+  }
+  if (d.title === serverTitle && d.body === serverBody) {
+    clearDraft(); // 差分なし＝救済不要
+    return;
+  }
+  const when = new Date(d.ts).toLocaleString('ja-JP');
+  if (window.confirm(`未保存の下書き（${when}）が見つかりました。復元しますか？\n［キャンセル］でサーバー上の内容を表示します。`)) {
+    el('title-input').value = d.title;
+    el('body-input').value = d.body;
+  } else {
+    clearDraft();
+  }
+}
+
+// --- ③ トークン取得を Promise 化 ---
+
+function ensureToken(interactive) {
+  return new Promise((resolve) => {
+    tokenResolve = resolve;
+    try {
+      tokenClient.requestAccessToken({ prompt: interactive ? '' : 'none' });
+    } catch (e) {
+      tokenResolve = null;
+      resolve(false);
+    }
+  });
+}
+
+async function onSignedIn() {
+  showApp(true);
+  showListView();
+  await listFiles();
+}
+
 async function driveFetch(url, options = {}) {
   const res = await fetch(url, {
     ...options,
@@ -51,8 +143,13 @@ async function driveFetch(url, options = {}) {
     },
   });
   if (res.status === 401) {
-    setStatus('認証の有効期限が切れました。再度サインインしてください。');
-    showApp(false);
+    accessToken = null;
+    if (isEditorOpen()) {
+      saveDraftNow(); // 入力内容を退避してからエラーを投げる（エディタは隠さない）
+    } else {
+      setStatus('認証の有効期限が切れました。再度サインインしてください。');
+      showApp(false);
+    }
     throw new Error('unauthorized');
   }
   if (!res.ok) {
@@ -304,10 +401,12 @@ async function openFile(id, name) {
   const res = await driveFetch(`${DRIVE_FILES_API}/${id}?alt=media`);
   const text = await res.text();
   currentFile = { id, name };
-  el('title-input').value = stripExt(name);
+  const title = stripExt(name);
+  el('title-input').value = title;
   el('body-input').value = text;
   el('archive-btn').classList.toggle('hidden', currentFolder !== 'active');
   showEditorView();
+  maybeRestoreDraft(title, text);
   setStatus('');
 }
 
@@ -317,6 +416,7 @@ function newFile() {
   el('body-input').value = '';
   el('archive-btn').classList.add('hidden');
   showEditorView();
+  maybeRestoreDraft('', '');
 }
 
 function buildMultipartBody(metadata, content) {
@@ -332,16 +432,7 @@ function buildMultipartBody(metadata, content) {
   return { body, boundary };
 }
 
-async function saveFile() {
-  const title = el('title-input').value.trim();
-  const content = el('body-input').value;
-  if (!title) {
-    setStatus('タイトルを入力してください');
-    return;
-  }
-  const name = title.endsWith('.txt') ? title : `${title}.txt`;
-  setStatus('保存中...');
-
+async function doSave(name, content) {
   if (currentFile && currentFile.id) {
     const metadata = { name };
     const { body, boundary } = buildMultipartBody(metadata, content);
@@ -359,7 +450,50 @@ async function saveFile() {
       body,
     });
   }
+}
 
+async function saveFile() {
+  const title = el('title-input').value.trim();
+  const content = el('body-input').value;
+  if (!title) {
+    setStatus('タイトルを入力してください');
+    return;
+  }
+  saveDraftNow(); // 保存試行の前に必ず退避
+  const name = title.endsWith('.txt') ? title : `${title}.txt`;
+
+  // ③ 長時間経過していれば先にトークンをサイレント更新
+  if (accessToken && Date.now() - tokenObtainedAt > TOKEN_REFRESH_MS) {
+    setStatus('セッションを更新中...');
+    await ensureToken(false);
+  }
+
+  setStatus('保存中...');
+  try {
+    await doSave(name, content);
+  } catch (e) {
+    if (e.message !== 'unauthorized') {
+      setStatus('保存に失敗しました。入力内容は下書きに保存済みです。');
+      return;
+    }
+    // ② セッション切れ時のリカバリ（エディタは維持したまま再認証→再保存）
+    setStatus('セッションが切れました。再認証しています...');
+    let ok = await ensureToken(false);
+    if (!ok) ok = await ensureToken(true);
+    if (!ok) {
+      setStatus('再認証できませんでした。入力内容は下書きに保存済みです。サインインし直してから、もう一度［保存］を押してください。');
+      return;
+    }
+    try {
+      setStatus('保存中...');
+      await doSave(name, content);
+    } catch (e2) {
+      setStatus('保存に失敗しました。入力内容は下書きに保存済みです。');
+      return;
+    }
+  }
+
+  clearDraft(); // 保存成功したので下書きを破棄
   setStatus('保存しました');
   showListView();
   await listFiles();
@@ -415,15 +549,17 @@ function initGoogle() {
   tokenClient = google.accounts.oauth2.initTokenClient({
     client_id: CONFIG.CLIENT_ID,
     scope: CONFIG.SCOPES,
-    callback: async (resp) => {
+    callback: (resp) => {
+      const resolve = tokenResolve;
+      tokenResolve = null;
       if (resp.error) {
-        setStatus(`サインインエラー: ${resp.error}`);
+        if (resolve) resolve(false);
+        else setStatus(`サインインエラー: ${resp.error}`);
         return;
       }
       accessToken = resp.access_token;
-      showApp(true);
-      showListView();
-      await listFiles();
+      tokenObtainedAt = Date.now();
+      if (resolve) resolve(true);
     },
   });
 }
@@ -433,6 +569,7 @@ function signOut() {
     google.accounts.oauth2.revoke(accessToken, () => {});
   }
   accessToken = null;
+  tokenObtainedAt = 0;
   showApp(false);
 }
 
@@ -443,8 +580,13 @@ window.addEventListener('load', () => {
     e.preventDefault();
     lastDragClientY = e.clientY;
   });
-  el('signin-btn').addEventListener('click', () => tokenClient.requestAccessToken());
+  el('signin-btn').addEventListener('click', async () => {
+    const ok = await ensureToken(true);
+    if (ok) await onSignedIn();
+  });
   el('signout-btn').addEventListener('click', signOut);
+  el('title-input').addEventListener('input', scheduleDraftSave);
+  el('body-input').addEventListener('input', scheduleDraftSave);
   el('new-btn').addEventListener('click', newFile);
   el('refresh-btn').addEventListener('click', listFiles);
   el('sort-select').addEventListener('change', sortAndRender);
