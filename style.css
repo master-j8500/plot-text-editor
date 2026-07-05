@@ -39,6 +39,11 @@ button:active {
   opacity: 0.8;
 }
 
+button:disabled {
+  background: #aaa;
+  cursor: not-allowed;
+}
+
 .hidden {
   display: none !important;
 }
@@ -49,8 +54,31 @@ main {
   padding: 16px;
 }
 
+.folder-tabs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+  border-bottom: 1px solid #ddd;
+}
+
+.tab-btn {
+  background: transparent;
+  color: #666;
+  border-radius: 0;
+  padding: 8px 4px;
+  margin-bottom: -1px;
+  border-bottom: 2px solid transparent;
+}
+
+.tab-btn.active {
+  color: #4a86e8;
+  border-bottom: 2px solid #4a86e8;
+  font-weight: bold;
+}
+
 .toolbar {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   margin-bottom: 12px;
 }
@@ -65,15 +93,35 @@ main {
 }
 
 #file-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   background: #fff;
   border: 1px solid #ddd;
   border-radius: 8px;
-  padding: 12px 14px;
+  padding: 10px 14px;
   cursor: pointer;
 }
 
 #file-list li:active {
   background: #eee;
+}
+
+#file-list li.dragging {
+  opacity: 0.4;
+}
+
+.drag-handle {
+  color: #999;
+  cursor: grab;
+  padding: 0 4px;
+  font-size: 16px;
+  line-height: 1;
+}
+
+.file-main {
+  flex: 1;
+  min-width: 0;
 }
 
 .file-title {
@@ -92,6 +140,13 @@ main {
   text-overflow: ellipsis;
 }
 
+.archive-btn {
+  background: #6aa84f;
+  padding: 6px 10px;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
 #sort-select {
   font-size: 14px;
   padding: 8px 10px;
@@ -99,6 +154,11 @@ main {
   border-radius: 6px;
   background: #fff;
   color: #222;
+}
+
+#sort-select:disabled {
+  background: #eee;
+  color: #999;
 }
 
 #title-input {

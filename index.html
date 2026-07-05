@@ -16,6 +16,10 @@
 
   <main id="app" class="hidden">
     <section id="list-view">
+      <div class="folder-tabs">
+        <button id="tab-active" class="tab-btn active">未執筆</button>
+        <button id="tab-written" class="tab-btn">執筆済み</button>
+      </div>
       <div class="toolbar">
         <button id="new-btn">＋ 新規メモ</button>
         <button id="refresh-btn">更新</button>
@@ -25,6 +29,8 @@
           <option value="modified-desc">更新日時（新しい順）</option>
           <option value="modified-asc">更新日時（古い順）</option>
         </select>
+        <button id="reorder-btn">並べ替えモード</button>
+        <button id="renumber-btn" class="hidden">番号を再付与</button>
       </div>
       <ul id="file-list"></ul>
     </section>
@@ -32,6 +38,7 @@
     <section id="editor-view" class="hidden">
       <div class="toolbar">
         <button id="back-btn">← 一覧へ</button>
+        <button id="archive-btn" class="hidden">執筆済みへ移動</button>
         <button id="save-btn">保存</button>
       </div>
       <input id="title-input" type="text" placeholder="タイトル（ファイル名）">
