@@ -4,14 +4,26 @@ const WRITTEN_FOLDER_NAME = '執筆済み';
 const DRAFT_PREFIX = 'plotdraft:';
 const NEW_DRAFT_KEY = '__new__';
 const TOKEN_REFRESH_MS = 45 * 60 * 1000; // 45分経過したら保存前にトークンを更新
+const PLOT_CATEGORIES = [
+  ['main', '本編'],
+  ['setting', '設定'],
+  ['unclassified', '未分類'],
+];
 
 let accessToken = null;
 let tokenClient = null;
 let tokenObtainedAt = 0;
 let tokenResolve = null; // requestAccessToken を Promise 化するための resolver
+let tokenRequest = null;
 let tokenRefreshTimer = null; // 失効前サイレント更新のタイマー
 let currentFile = null; // { id, name } または null（新規）
-let allFiles = []; // { id, name, modifiedTime, snippet }
+let allFiles = []; // { id, name, modifiedTime, properties, snippet }
+let categoryFilter = 'all';
+let categoryUpdating = false;
+const categoryNeedsRefresh = new Set();
+const categoryStates = new Map();
+let categoryRevision = 0;
+let listRequest = 0;
 let currentFolder = 'active'; // 'active' | 'written'
 let writtenFolderId = null;
 let reorderMode = false;
@@ -118,7 +130,8 @@ function maybeRestoreDraft(serverTitle, serverBody) {
 // --- ③ トークン取得を Promise 化 ---
 
 function ensureToken(interactive) {
-  return new Promise((resolve) => {
+  if (tokenRequest) return tokenRequest;
+  const request = new Promise((resolve) => {
     let settled = false;
     // callback / error_callback / タイムアウトのいずれか一度だけ解決する
     const finish = (ok) => {
@@ -137,6 +150,17 @@ function ensureToken(interactive) {
       finish(false);
     }
   });
+  tokenRequest = request;
+  request.then(() => {
+    if (tokenRequest === request) tokenRequest = null;
+  });
+  return request;
+}
+
+async function reauthenticate() {
+  let ok = await ensureToken(false);
+  if (!ok) ok = await ensureToken(true);
+  return ok;
 }
 
 // 失効の2分前にサイレント更新を予約する（放置中もトークンを延命）
@@ -172,11 +196,18 @@ async function driveFetch(url, options = {}) {
       setStatus('認証の有効期限が切れました。再度サインインしてください。');
       showApp(false);
     }
-    throw new Error('unauthorized');
+    const error = new Error('unauthorized');
+    error.status = res.status;
+    throw error;
   }
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Drive API error (${res.status}): ${text}`);
+    let text = '';
+    try {
+      text = await res.text();
+    } catch (e) {}
+    const error = new Error(`Drive API error (${res.status}): ${text}`);
+    error.status = res.status;
+    throw error;
   }
   return res;
 }
@@ -232,6 +263,8 @@ async function getActiveFolderId() {
 function setFolderTab(kind) {
   if (currentFolder === kind) return;
   currentFolder = kind;
+  categoryFilter = 'all';
+  el('category-filter').value = categoryFilter;
   el('tab-active').classList.toggle('active', kind === 'active');
   el('tab-written').classList.toggle('active', kind === 'written');
   el('new-btn').classList.toggle('hidden', kind !== 'active');
@@ -240,9 +273,13 @@ function setFolderTab(kind) {
   listFiles();
 }
 
-async function listFiles() {
+async function listFiles(refreshCategories = false) {
+  const request = ++listRequest;
+  const folder = currentFolder;
+  const revision = categoryRevision;
   setStatus('読み込み中...');
   const folderId = await getActiveFolderId();
+  if (request !== listRequest || folder !== currentFolder) return;
   if (!folderId) {
     allFiles = [];
     sortAndRender();
@@ -252,15 +289,24 @@ async function listFiles() {
   const q = encodeURIComponent(
     `'${folderId}' in parents and trashed=false and mimeType='text/plain'`
   );
-  const fields = encodeURIComponent('files(id,name,modifiedTime)');
+  const fields = encodeURIComponent('files(id,name,modifiedTime,properties)');
   const url = `${DRIVE_FILES_API}?q=${q}&fields=${fields}&pageSize=200`;
   const res = await driveFetch(url);
   const data = await res.json();
   const files = data.files || [];
 
+  if (request !== listRequest || folder !== currentFolder) return;
   setStatus('本文を読み込み中...');
   const snippets = await Promise.all(files.map((f) => fetchSnippet(f.id)));
-  allFiles = files.map((f, i) => ({ ...f, snippet: snippets[i] }));
+  if (request !== listRequest || folder !== currentFolder) return;
+  allFiles = files.map((f, i) => {
+    const confirmed = categoryStates.get(f.id);
+    if (confirmed && confirmed.revision > revision) {
+      return { ...f, properties: confirmed.properties, modifiedTime: confirmed.modifiedTime, snippet: snippets[i] };
+    }
+    if (refreshCategories) categoryNeedsRefresh.delete(f.id);
+    return { ...f, snippet: snippets[i] };
+  });
 
   sortAndRender();
   setStatus('');
@@ -288,18 +334,21 @@ function getSortedFiles() {
 }
 
 function sortAndRender() {
+  updateCategoryControls();
   if (reorderMode) {
     renderFileList(orderedFiles);
     return;
   }
-  renderFileList(getSortedFiles());
+  const files = getSortedFiles();
+  renderFileList(categoryFilter === 'all' ? files : files.filter((f) => getPlotCategory(f) === categoryFilter));
 }
 
 function enterReorderMode() {
-  if (currentFolder !== 'active') return;
+  if (currentFolder !== 'active' || categoryFilter !== 'all' || categoryUpdating) return;
   reorderMode = true;
   orderedFiles = getSortedFiles();
   el('sort-select').disabled = true;
+  updateCategoryControls();
   el('reorder-btn').textContent = '並べ替え終了';
   el('renumber-btn').classList.remove('hidden');
   renderFileList(orderedFiles);
@@ -310,6 +359,7 @@ function exitReorderMode(reRender = true) {
   dragSrcIndex = null;
   stopAutoScroll();
   el('sort-select').disabled = false;
+  updateCategoryControls();
   el('reorder-btn').textContent = '並べ替えモード';
   el('renumber-btn').classList.add('hidden');
   if (reRender) sortAndRender();
@@ -346,7 +396,7 @@ function renderFileList(files) {
   listEl.innerHTML = '';
   if (files.length === 0) {
     const li = document.createElement('li');
-    li.textContent = 'ファイルがありません';
+    li.textContent = categoryFilter === 'all' ? 'ファイルがありません' : 'この分類のファイルはありません';
     listEl.appendChild(li);
     return;
   }
@@ -401,6 +451,42 @@ function renderFileList(files) {
       mainEl.addEventListener('click', () => openFile(f.id, f.name));
     }
     li.appendChild(mainEl);
+
+    const categoryEl = document.createElement('label');
+    categoryEl.className = 'file-category';
+    const categoryLabel = document.createElement('span');
+    categoryLabel.textContent = '分類';
+    categoryEl.appendChild(categoryLabel);
+    const categorySelect = document.createElement('select');
+    categorySelect.className = 'category-select';
+    categorySelect.dataset.fileId = f.id;
+    for (const [value, label] of PLOT_CATEGORIES) {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = label;
+      categorySelect.appendChild(option);
+    }
+    if (getPlotCategory(f) === 'unclassified' && f.properties?.plotCategory !== 'unclassified') {
+      const placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = '未分類';
+      placeholder.disabled = true;
+      placeholder.hidden = true;
+      categorySelect.prepend(placeholder);
+      categorySelect.value = '';
+    } else {
+      categorySelect.value = getPlotCategory(f);
+    }
+    categorySelect.disabled = categoryUpdating || reorderMode || categoryNeedsRefresh.has(f.id);
+    categorySelect.addEventListener('change', () => updatePlotCategory(f.id, categorySelect.value));
+    categoryEl.appendChild(categorySelect);
+    if (categoryNeedsRefresh.has(f.id)) {
+      const warning = document.createElement('span');
+      warning.className = 'category-refresh-needed';
+      warning.textContent = '要更新：［更新］してください';
+      categoryEl.appendChild(warning);
+    }
+    li.appendChild(categoryEl);
 
     if (currentFolder === 'active' && !reorderMode) {
       const archiveBtn = document.createElement('button');
@@ -500,8 +586,7 @@ async function saveFile() {
     }
     // ② セッション切れ時のリカバリ（エディタは維持したまま再認証→再保存）
     setStatus('セッションが切れました。再認証しています...');
-    let ok = await ensureToken(false);
-    if (!ok) ok = await ensureToken(true);
+    const ok = await reauthenticate();
     if (!ok) {
       setStatus('再認証できませんでした。入力内容は下書きに保存済みです。サインインし直してから、もう一度［保存］を押してください。');
       return;
@@ -519,6 +604,100 @@ async function saveFile() {
   setStatus('保存しました');
   showListView();
   await listFiles();
+}
+
+function getPlotCategory(file) {
+  const value = file.properties?.plotCategory;
+  return PLOT_CATEGORIES.some(([v]) => v === value) ? value : 'unclassified';
+}
+
+function updateCategoryControls() {
+  el('category-filter').disabled = reorderMode;
+  el('reorder-btn').disabled = categoryUpdating || categoryFilter !== 'all';
+  document.querySelectorAll('.category-select').forEach((select) => {
+    select.disabled = categoryUpdating || reorderMode || categoryNeedsRefresh.has(select.dataset.fileId);
+  });
+}
+
+async function readCategoryMetadata(res, id) {
+  const data = await res.json();
+  if (!data || data.id !== id || typeof data.modifiedTime !== 'string' ||
+      (data.properties !== undefined && (!data.properties || typeof data.properties !== 'object' || Array.isArray(data.properties)))) {
+    throw new Error('分類の応答を確認できませんでした');
+  }
+  return { properties: data.properties, modifiedTime: data.modifiedTime };
+}
+
+function confirmCategoryMetadata(id, metadata) {
+  categoryStates.set(id, { ...metadata, revision: ++categoryRevision });
+  allFiles = allFiles.map((file) => file.id === id ? { ...file, ...metadata } : file);
+  categoryNeedsRefresh.delete(id);
+}
+
+async function updatePlotCategory(id, v) {
+  if (v !== 'main' && v !== 'setting' && v !== 'unclassified') return;
+  if (categoryUpdating || reorderMode || categoryNeedsRefresh.has(id)) return;
+  const file = allFiles.find((f) => f.id === id);
+  if (!file) return;
+  categoryUpdating = true;
+  const body = JSON.stringify({ properties: { plotCategory: v } });
+  const url = `${DRIVE_FILES_API}/${id}?fields=id,properties,modifiedTime`;
+  let updateSucceeded = false;
+  let message = '';
+  try {
+    updateCategoryControls();
+    setStatus('分類を更新中...');
+    try {
+      if (accessToken && Date.now() - tokenObtainedAt > TOKEN_REFRESH_MS) {
+        await ensureToken(false);
+      }
+      const patch = () => driveFetch(url, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+      });
+      let res;
+      try {
+        res = await patch();
+      } catch (e) {
+        if (e.message !== 'unauthorized') throw e;
+        const ok = await reauthenticate();
+        if (!ok) throw e;
+        showApp(true);
+        res = await patch();
+      }
+      const metadata = await readCategoryMetadata(res, id);
+      confirmCategoryMetadata(id, metadata);
+      updateSucceeded = true;
+    } catch (e) {
+      if (e.status) {
+        message = e.status === 401
+          ? '分類を変更できませんでした。サインインし直してから再度お試しください。'
+          : '分類を変更できませんでした。最後に確認した分類へ戻しました。';
+      } else {
+        try {
+          const res = await driveFetch(url);
+          const metadata = await readCategoryMetadata(res, id);
+          confirmCategoryMetadata(id, metadata);
+          updateSucceeded = true;
+        } catch (confirmationError) {
+          const confirmed = allFiles.find((f) => f.id === id) || file;
+          categoryStates.set(id, {
+            properties: confirmed.properties,
+            modifiedTime: confirmed.modifiedTime,
+            revision: ++categoryRevision,
+          });
+          categoryNeedsRefresh.add(id);
+          message = '分類の結果を確認できませんでした。要更新：［更新］してください。';
+        }
+      }
+    }
+  } finally {
+    categoryUpdating = false;
+    updateCategoryControls();
+  }
+  setStatus(updateSucceeded ? '分類を確認しました' : message);
+  sortAndRender();
 }
 
 async function renameFile(id, newName) {
@@ -622,8 +801,12 @@ window.addEventListener('load', () => {
   el('title-input').addEventListener('input', scheduleDraftSave);
   el('body-input').addEventListener('input', scheduleDraftSave);
   el('new-btn').addEventListener('click', newFile);
-  el('refresh-btn').addEventListener('click', listFiles);
+  el('refresh-btn').addEventListener('click', () => listFiles(true));
   el('sort-select').addEventListener('change', sortAndRender);
+  el('category-filter').addEventListener('change', () => {
+    categoryFilter = el('category-filter').value;
+    sortAndRender();
+  });
   el('reorder-btn').addEventListener('click', toggleReorderMode);
   el('renumber-btn').addEventListener('click', renumberFiles);
   el('back-btn').addEventListener('click', showListView);
